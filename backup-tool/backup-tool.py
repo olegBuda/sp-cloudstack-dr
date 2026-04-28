@@ -12,7 +12,7 @@ from typing import Dict, Any, Optional
 import cs
 
 # pip install storpool
-from storpool import spapi
+from storpool import spapi, spconfig
 import confget
 
 config = None  # Config is in /etc/storpool/backup-tool.conf
@@ -106,6 +106,37 @@ def list_volumes(backup_list, quiet=False):
             )
 
 
+def get_cluster_map() -> Dict[str, str]:
+    """ Return volumes mapped to cluster names """
+
+    clusterFullId = spconfig.SPConfig()['SP_CLUSTER_ID']
+    clusterId, locationId = clusterFullId.split('.')
+
+    locationName = [
+        k.name for k in sp_api.locationsList()['locations']
+        if k.id == locationId
+    ]
+    if len(locationName) == 0:
+        logging.error("This cluster's location is not defined: %s.", locationId)
+        sys.exit(1)
+
+    clusters = [
+        (k.name, k.id) for k in sp_api.clustersList()['clusters']
+        if k.location == locationName[0]
+    ]
+    if clusterId not in map(lambda x: x[1], clusters):
+        logging.error("This cluster is not defined in clusters list: %s.", clusterFullId)
+        sys.exit(1)
+
+    volumes = {}
+    for cluster, _ in clusters:
+        logging.debug("Collecting StorPool volume list from %s", cluster)
+        volumes.update({
+            vol.name: cluster
+            for vol in sp_api.volumesList(clusterName=cluster)
+        })
+    return volumes
+
 
 def is_error_cs_result(res):
     if "errorcode" in res:
@@ -113,7 +144,7 @@ def is_error_cs_result(res):
         sys.exit(1)
 
 
-def revert_vm(backup: Dict[str, Any]) -> None:
+def revert_vm(backup: Dict[str, Any], cluster_map: Dict[str, str]) -> None:
     """
     Restores a VM from a backup
 
@@ -158,24 +189,22 @@ def revert_vm(backup: Dict[str, Any]) -> None:
     logging.debug("VM %s is stopped", vm_uuid)
 
     # detach all volumes. May not be needed, but to ensure
-    logging.debug(
-        "Detaching volumes: %s",
-        [v["sp_volume_name"] for v in volume_list]
-    )
-    args = {
-        "reassign": [
-            {
-                "volume": vol["sp_volume_name"],
-                "detach": "all",
-            }
-            for vol in volume_list
-        ],
-    }
-    sp_api.volumesReassignWait(args)
-
-    # copy snapshots to the local cluster
-    logging.debug("Copy snapshots to the local cluster")
     for vol in volume_list:
+        logging.debug("Detaching volume: %s", vol["sp_volume_name"])
+        cluster_name = cluster_map.get(vol["sp_volume_name"])
+        args = {
+            "reassign": [
+                {
+                    "volume": vol["sp_volume_name"],
+                    "detach": "all",
+                }
+            ],
+        }
+        sp_api.volumesReassignWait(args, clusterName=cluster_name)
+
+    # copy snapshots to the destination cluster
+    for vol in volume_list:
+        cluster_name = cluster_map.get(vol["sp_volume_name"])
         snapshot_name = vol["sp_snapshot"]
         snapshot_gid = snapshot_name.lstrip("~")
         args = {
@@ -183,16 +212,18 @@ def revert_vm(backup: Dict[str, Any]) -> None:
             "remoteLocation": config["SP_BACKUP_LOCATION_NAME"],
             "template": config["SP_LOCAL_TEMPLATE"],
         }
+        logging.debug("Copy snapshot %s to %s", snapshot_name, cluster_name)
         try:
-            res = sp_api.snapshotFromRemote(args)
+            res = sp_api.snapshotFromRemote(args, clusterName=cluster_name)
         except spapi.ApiError as err:
             # A local copy of the snapshot may already be created. This is OK.
             if err.name != "objectExists":
                 raise
 
-    # revert volumes using local snapshots
-    logging.debug("Revert volumes using local snapshots")
+    # revert volumes using copied snapshots
+    logging.debug("Revert volumes using copied snapshots")
     for vol in volume_list:
+        cluster_name = cluster_map.get(vol["sp_volume_name"])
         volume_name = vol["sp_volume_name"]
         snapshot_name = vol["sp_snapshot"]
         args = {
@@ -200,13 +231,14 @@ def revert_vm(backup: Dict[str, Any]) -> None:
         }
         logging.debug("Revert volume %s to snapshot %s",
             volume_name, snapshot_name)
-        res = sp_api.volumeRevert(volume_name, args)
+        res = sp_api.volumeRevert(volume_name, args, clusterName=cluster_name)
 
-    # delete snapshots on the local cluster
-    logging.debug("Delete snapshots on the local cluster")
+    # delete temporary snapshots
     for vol in volume_list:
+        cluster_name = cluster_map.get(vol["sp_volume_name"])
         snapshot_name = vol["sp_snapshot"]
-        sp_api.snapshotDelete(snapshot_name)
+        logging.debug("Delete snapshot %s on %s", snapshot_name, cluster_name)
+        sp_api.snapshotDelete(snapshot_name, clusterName=cluster_name)
 
     logging.info("Revert completed")
 
@@ -270,7 +302,7 @@ def create_volume_and_attach(
     #
     logging.info("Create a new volume")
     logging.debug("Creating the new volume in domain ID %s", vm["domainid"])
-    logging.debug("Creating the new voluem with account %s", vm["account"])
+    logging.debug("Creating the new volume with account %s", vm["account"])
     jobid = cs_api.createVolume(
         account = vm["account"],
         domainid = vm["domainid"],
@@ -312,6 +344,14 @@ def create_volume_and_attach(
     #
     # revert the newly created SP volume to the snapshot
     #
+    cluster_map = get_cluster_map()
+    volume_cluster = cluster_map[sp_volume_name]
+    this_cluster = spconfig.SPConfig()['SP_CLUSTER_NAME']
+    if volume_cluster != this_cluster:
+        logging.debug("Volume is in a different sub-cluster. We are %s", this_cluster)
+        logging.info("Moving snapshot %s to %s", snapshot_name, volume_cluster)
+        sp_api.snapshotMoveToRemote(snapshot_name, {"cluster": volume_cluster})
+
     logging.debug(
         "Revert the new volume %s to the snapshot %s", sp_volume_name,
         snapshot_name
@@ -319,7 +359,7 @@ def create_volume_and_attach(
     args = {
         "toSnapshot": snapshot_name,
     }
-    res = sp_api.volumeRevert(sp_volume_name, args)
+    res = sp_api.volumeRevert(sp_volume_name, args, clusterName=volume_cluster)
 
     #
     # attach the cs volume to the VM
@@ -332,10 +372,10 @@ def create_volume_and_attach(
     logging.info("Volume attached")
 
     #
-    # delete snapshots on the local cluster
+    # delete temporary snapshots
     #
-    logging.debug("Delete snapshot %s", snapshot_name)
-    sp_api.snapshotDelete(snapshot_name)
+    logging.debug("Delete snapshot %s on %s", snapshot_name, volume_cluster)
+    sp_api.snapshotDelete(snapshot_name, clusterName=volume_cluster)
 
 
 def check_backup_is_uuid_format(backup_list) -> None:
@@ -354,6 +394,7 @@ def restore_vm(
         backup: Dict[str, Any],
         new_vm_uuid: str,
         root_uuid: Optional[str],
+        cluster_map: Dict[str, str],
 ) -> None:
 
     """
@@ -495,52 +536,55 @@ def restore_vm(
     logging.debug("VM %s is stopped", new_vm_uuid)
 
     # Detach all volumes on the StorPool side. May not be needed, but to ensure
-    logging.debug(
-        "Detaching volumes: %s",
-        [v["sp_volume_name"] for v in volume_list]
-    )
-    args = {
-        "reassign": [
-            {
-                "volume": vol["sp_volume_name"],
-                "detach": "all",
-            }
-            for vol in volume_list
-        ],
-    }
-    sp_api.volumesReassignWait(args)
+    for vol in volume_list:
+        logging.debug("Detaching volume: %s", vol["sp_volume_name"])
+        cluster_name = cluster_map.get(vol["sp_volume_name"])
+        args = {
+            "reassign": [
+                {
+                    "volume": vol["sp_volume_name"],
+                    "detach": "all",
+                }
+            ],
+        }
+        sp_api.volumesReassignWait(args, clusterName=cluster_name)
 
-    # Copy snapshots to the local cluster
-    logging.debug("Copy snapshots to the local cluster")
+    # Copy snapshots to the destination cluster
     for vol in volume_list:
         snapshot_name = vol["sp_snapshot"]
         snapshot_gid = snapshot_name.lstrip("~")
+        cluster_name = cluster_map.get(vol["sp_volume_name"])
         args = {
             "remoteId": snapshot_gid,
             "remoteLocation": config["SP_BACKUP_LOCATION_NAME"],
             "template": config["SP_LOCAL_TEMPLATE"],
         }
+        logging.debug("Copy snapshot %s to %s", snapshot_name, cluster_name)
         try:
-            sp_api.snapshotFromRemote(args)
+            sp_api.snapshotFromRemote(args, clusterName=cluster_name)
         except spapi.ApiError as err:
             # A local copy of the snapshot may already be created. This is OK.
             if err.name != "objectExists":
                 raise
 
-    # Revert target volumes using the local snapshots
-    logging.debug("Revert volumes using local snapshots")
+    # Revert target volumes using the copied snapshots
+    logging.debug("Revert volumes using copied snapshots")
     for vol in volume_list:
         volume_name = vol["sp_volume_name"]
         snapshot_name = vol["sp_snapshot"]
-        logging.debug("Revert volume %s to snapshot %s",
-            volume_name, snapshot_name)
-        sp_api.volumeRevert(volume_name, {"toSnapshot": snapshot_name,
-                                          "revertSize": True})
+        cluster_name = cluster_map.get(vol["sp_volume_name"])
+        logging.debug("Revert volume %s to snapshot %s", volume_name, snapshot_name)
+        args = {
+            "toSnapshot": snapshot_name,
+            "revertSize": True
+        }
+        sp_api.volumeRevert(volume_name, args, clusterName=cluster_name)
 
-    # Delete snapshots on the local cluster
-    logging.debug("Delete snapshots on the local cluster")
+    # Delete temporary snapshots
     for vol in volume_list:
-        sp_api.snapshotDelete(vol["sp_snapshot"])
+        cluster_name = cluster_map.get(vol["sp_volume_name"])
+        logging.debug("Delete snapshot %s on %s", vol["sp_snapshot"], cluster_name)
+        sp_api.snapshotDelete(vol["sp_snapshot"], clusterName=cluster_name)
 
     logging.info("Restore completed")
 
@@ -629,13 +673,14 @@ def main():
 
     if args.command == "revert":
         backup_list = get_backup_list(args.vm_uuid)
+        cluster_map = get_cluster_map()
         try:
             backup = backup_list[args.backup_id]
         except KeyError:
             logging.error("Backup ID %s not found for VM %s",
                           args.backup_id, args.vm_uuid)
             sys.exit(1)
-        revert_vm(backup)
+        revert_vm(backup, cluster_map)
         return 0
 
     if args.command == "attach":
@@ -651,13 +696,14 @@ def main():
 
     if args.command == "restore":
         backup_list = get_backup_list(args.vm_uuid)
+        cluster_map = get_cluster_map()
         try:
             backup = backup_list[args.backup_id]
         except KeyError:
             logging.error("Backup ID %s not found for VM %s",
                           args.backup_id, args.vm_uuid)
             sys.exit(1)
-        restore_vm(backup, args.new_vm_uuid, args.root_uuid)
+        restore_vm(backup, args.new_vm_uuid, args.root_uuid, cluster_map)
         return 0
 
 
